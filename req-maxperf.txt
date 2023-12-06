@@ -1,5 +1,4 @@
 wheel
-
 torch==2.1.0
 torchvision
 xformers
@@ -19,4 +18,5 @@ transformers
 regex
 accelerate
 omegaconf
-PyQt5
+PyQt6
+flash-attn

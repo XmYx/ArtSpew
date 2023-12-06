@@ -1,5 +1,4 @@
 import sys
-import PIL
 from PyQt6 import QtWidgets, QtCore
 from PyQt6.QtWidgets import QApplication
 from PyQt6.QtWidgets import QWidget, QSlider, QLabel, QLineEdit, QPushButton
@@ -337,7 +336,6 @@ prev_prompt = None
 pe = None
 
 def genit(mode, prompts, batchSize, nSteps):
-    print(prompts)
     #tm0 = time.time()
     global prev_prompt, pe
     if prev_prompt != prompts or pe is None:
