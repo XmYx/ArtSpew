@@ -1,16 +1,17 @@
 import sys
 import PIL
-from PyQt5 import QtWidgets, QtCore
-from PyQt5.QtWidgets import QApplication
-from PyQt5.QtWidgets import QWidget, QSlider, QLabel, QLineEdit, QPushButton
-from PyQt5.QtWidgets import QVBoxLayout, QHBoxLayout, QGridLayout
-from PyQt5.QtGui import QPixmap, QImage, QColor, QPen, QFont, QPainter
-from PyQt5.QtCore import Qt, QTimer, QEvent, pyqtSignal, QCoreApplication
+from PyQt6 import QtWidgets, QtCore
+from PyQt6.QtWidgets import QApplication
+from PyQt6.QtWidgets import QWidget, QSlider, QLabel, QLineEdit, QPushButton
+from PyQt6.QtWidgets import QVBoxLayout, QHBoxLayout, QGridLayout
+from PyQt6.QtGui import QPixmap, QImage, QColor, QPen, QFont, QPainter
+from PyQt6.QtCore import Qt, QTimer, QEvent, pyqtSignal, QCoreApplication
 
 import numpy as np
 
 import torch
 from diffusers import AutoPipelineForText2Image
+from sd_base_pipeline import StableDiffusionPipeline
 from sfast.compilers.stable_diffusion_pipeline_compiler import (compile, CompilationConfig)
 
 torch.set_grad_enabled(False)
@@ -20,7 +21,6 @@ torch.backends.cudnn.allow_tf32 = True
 mw = None
 batchSize = 10
 prompts = ['Evil space kitty', 'Cute dog in hat, H.R. Giger style', 'Horse wearing a tie', 'Cartoon pig', 'Donkey on Mars', 'Cute kitties baked in a cake', 'Boxing chickens on farm, Maxfield Parish style', 'Future spaceship', 'A city of the past', 'Jabba the Hut wearing jewelery']
-
 def dwencode(pipe, prompts, batchSize: int, nTokens: int):
     tokenizer = pipe.tokenizer
     text_encoder = pipe.text_encoder
@@ -70,7 +70,7 @@ def dwencode(pipe, prompts, batchSize: int, nTokens: int):
     return prompt_embeds
 
 
-pipe = AutoPipelineForText2Image.from_pretrained("stabilityai/sd-turbo", torch_dtype=torch.float16, variant="fp16")
+pipe = StableDiffusionPipeline.from_pretrained("stabilityai/sd-turbo", torch_dtype=torch.float16, variant="fp16")
 pipe.to("cuda")
 #pipe.unet.to(memory_format=torch.channels_last)
 
@@ -114,12 +114,54 @@ if True:
         config.enable_cnn_optimization = True
         config.preserve_parameters = False
         config.prefer_lowp_gemm = True
+    mix = True
+    if mix:
+        # pipe.unet.to(memory_format=torch.channels_last)
+        pipe.enable_xformers_memory_efficient_attention()
+        pipe.safety_checker = None
+
+        config.enable_jit = True
+        config.enable_jit_freeze = True
+        config.enable_cuda_graph = True
+        config.enable_triton = True
+        config.enable_cnn_optimization = True
+        config.preserve_parameters = True
+        config.prefer_lowp_gemm = True
+        config.enable_xformers = True
+        config.channels_last = 'channels_last'
+        config.enable_fused_linear_geglu = True
+
+        from diffusers.models.attention import Attention
+        from torch.nn import Module, Linear
+        from flash_attention import FlashAttnProcessor, FlashAttnQKVPackedProcessor
+        cross_attn_processor = FlashAttnProcessor()
+        self_attn_processor = FlashAttnQKVPackedProcessor()
+
+        def set_flash_attn_processor(mod: Module) -> None:
+            if isinstance(mod, Attention):
+                # relying on a side-channel to determine (unreliably) whether a layer is self-attention
+                if mod.to_k.in_features == mod.to_q.in_features:
+                    # probably self-attention
+                    mod.to_qkv = Linear(mod.to_q.in_features, mod.to_q.out_features * 3, dtype=mod.to_q.weight.dtype,
+                                        device='cuda')
+                    mod.to_qkv.weight.data = torch.cat([mod.to_q.weight, mod.to_k.weight, mod.to_v.weight]).detach()
+                    del mod.to_q, mod.to_k, mod.to_v
+                    mod.set_processor(self_attn_processor)
+                else:
+                    mod.set_processor(cross_attn_processor)
+
+
 
     pipe = compile(pipe, config)
+    if mix:
+        pipe.unet.apply(set_flash_attn_processor)
+
 
 class MainWindow(QWidget):
     def __init__(self):
         super().__init__()
+
+
 
         self.lasttm = time.time()
 
@@ -146,35 +188,84 @@ class MainWindow(QWidget):
             self.imgs.append(QtWidgets.QLabel())
             self.imgs[ii].setFixedSize(512, 512)
 
-        # Layout the widgets
-        layout = QVBoxLayout()
+        # Main horizontal layout
+        mainLayout = QHBoxLayout()
 
-        l2 = QHBoxLayout()
-        l2.addWidget(self.fps)
-        l2.addWidget(self.seed)
-        l2.addWidget(self.go)
-        l2.addWidget(self.step)
-        l2.addWidget(self.stop)
-        layout.addLayout(l2)
+        # Left side layout for prompts and controls
+        leftLayout = QVBoxLayout()
+        # Add control buttons to the left layout
+        controlLayout = QHBoxLayout()
+        controlLayout.addWidget(self.fps)
+        #controlLayout.addWidget(self.seed)
+        controlLayout.addWidget(self.go)
+        controlLayout.addWidget(self.step)
+        controlLayout.addWidget(self.stop)
+        leftLayout.addWidget(self.seed)
+        leftLayout.addLayout(controlLayout)
+        # Layout for prompt editor
+        self.promptLayout = QVBoxLayout()
+        self.promptWidgets = []  # List to keep track of prompt widgets
 
-        imgl = QGridLayout()
+        # Button to add new prompt
+        self.addPromptBtn = QPushButton('Add Prompt', self)
+        self.addPromptBtn.clicked.connect(self.addPromptField)
+
+        leftLayout.addLayout(self.promptLayout)
+        leftLayout.addWidget(self.addPromptBtn)
+
+        # Initialize with one prompt field
+        self.addPromptField()
+
+
+
+        # Right side layout for images
+        rightLayout = QGridLayout()
+        self.imgs = []
         for ii in range(self.nImgs):
+            self.imgs.append(QtWidgets.QLabel())
+            self.imgs[ii].setFixedSize(512, 512)
             row = ii // 5
             col = ii % 5
-            imgl.addWidget(self.imgs[ii], row, col)
-        layout.addLayout(imgl)
+            rightLayout.addWidget(self.imgs[ii], row, col)
+
+        # Add left and right layouts to the main layout
+        mainLayout.addLayout(leftLayout)
+        mainLayout.addLayout(rightLayout)
+
+        # Set main layout
+        self.setLayout(mainLayout)
 
         self.timer = QTimer(self)
         self.timer.timeout.connect(self.do_event)
         self.timer_interval = 0
-
-        self.setLayout(layout)
 
         self.go.clicked.connect(self.do_go)
         self.step.clicked.connect(self.do_step)
         self.stop.clicked.connect(self.do_stop)
 
         self.genImage()
+
+    def addPromptField(self):
+        promptWidget = QLineEdit(self)
+        promptWidget.setText("Enter prompt")
+        deleteBtn = QPushButton("Delete", self)
+        deleteBtn.clicked.connect(lambda: self.deletePromptField(promptWidget, deleteBtn))
+
+        self.promptLayout.addWidget(promptWidget)
+        self.promptLayout.addWidget(deleteBtn)
+        self.promptWidgets.append((promptWidget, deleteBtn))
+
+    def deletePromptField(self, promptWidget, deleteBtn):
+        promptWidget.deleteLater()
+        deleteBtn.deleteLater()
+        self.promptWidgets.remove((promptWidget, deleteBtn))
+        self.updatePrompts()
+
+    def updatePrompts(self):
+        global prompts, batchSize
+        prompts = [widget.text() for widget, _ in self.promptWidgets if widget.text()]
+        batchSize = len(prompts)
+
 
     def post_button_click_event(self):
         event = QEvent(QEvent.Type(QEvent.MouseButtonPress))
@@ -202,15 +293,13 @@ class MainWindow(QWidget):
         self.timer.start(self.timer_interval)
 
     def genImage(self):
+        self.updatePrompts()
         global prompts, batchSize
         seed = random.randint(0, 2147483647)
         torch.manual_seed(seed)
 
         images = genit(0, prompts=prompts, batchSize=batchSize, nSteps=1)
-        for img in images:
-            imgData = img.tobytes('raw', 'RGB')
-            qImg = QImage(imgData, 512, 512, QImage.Format_RGB888)
-            pixmap = QPixmap.fromImage(qImg)
+        for pixmap in images:
             painter = QPainter(pixmap)
             font = QFont()
             font.setPointSize(32)
@@ -227,18 +316,41 @@ class MainWindow(QWidget):
 import time
 import random
 import torch
+def decode_fast(latents):
+    images = []
+    scaling_factor = pipe.vae.config.scaling_factor
+    for latent in latents:
+        with torch.no_grad():
+            image = pipe.vae.decode(latent.unsqueeze(0) / scaling_factor, return_dict=False)[0]
+            image = (image.squeeze(0) / 2 + 0.5).clamp(0, 1) * 255
+            image = image.permute(1, 2, 0).to(torch.uint8).cpu().numpy()
+        image_np = np.ascontiguousarray(image, dtype=np.uint8)
+        # Create a QImage from the NumPy array
+        height, width, channels = image_np.shape
+        bytes_per_line = 3 * width  # 3 bytes per pixel for RGB
+        qImg = QImage(image_np.data, width, height, bytes_per_line, QImage.Format.Format_RGB888)
+        # Convert QImage to QPixmap
+        images.append(QPixmap.fromImage(qImg))
+    return images
+
+prev_prompt = None
+pe = None
 
 def genit(mode, prompts, batchSize, nSteps):
+    print(prompts)
     #tm0 = time.time()
-    pe = dwencode(pipe, prompts, batchSize, 9)
-    images = pipe(
+    global prev_prompt, pe
+    if prev_prompt != prompts or pe is None:
+        prev_prompt = prompts
+        pe = dwencode(pipe, prompts, batchSize, 9)
+    latents = pipe(
+        batch_size=batchSize,
         prompt_embeds = pe,
         width=512, height=512,
         num_inference_steps = nSteps,
-        guidance_scale = 1,
-        output_type="pil",
-        return_dict=False
-    )[0]
+        guidance_scale = 1
+    )
+    images = decode_fast(latents)
     #print(f"time = {(1000*(time.time() - tm0)):3.1f} milliseconds")
 
     return images
@@ -255,4 +367,4 @@ if __name__ == '__main__':
     app = QApplication(sys.argv)
     mw = MainWindow()
     mw.show()
-    sys.exit(app.exec_())
+    sys.exit(app.exec())
